@@ -19,6 +19,7 @@ class SharedAdaLin(nn.Linear):
 
 
 class VAR(nn.Module):
+   # 11
     def __init__(
         self, vae_local: VQVAE,
         num_classes=1000, depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
