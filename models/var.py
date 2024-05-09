@@ -11,7 +11,7 @@ from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vqvae import VQVAE, VectorQuantizer2
 
-
+# 总的来说，SharedAdaLin 类是一个自定义的全连接层，它在进行线性变换后还会改变输出的形状。
 class SharedAdaLin(nn.Linear):
     def forward(self, cond_BD):
         C = self.weight.shape[0] // 6
@@ -30,50 +30,84 @@ class VAR(nn.Module):
         super().__init__()
         # 0. hyperparameters
         assert embed_dim % num_heads == 0
+        # 词汇表维度,词汇表数量
         self.Cvae, self.V = vae_local.Cvae, vae_local.vocab_size
+        # 深度,嵌入维度,嵌入维度,头数
         self.depth, self.C, self.D, self.num_heads = depth, embed_dim, embed_dim, num_heads
-        
+        # drop率
         self.cond_drop_rate = cond_drop_rate
+        # 逐步训练论
         self.prog_si = -1   # progressive training
-        
+
+        # `patch_nums` 是一个元组，其中包含了不同阶段的图像块数量。
         self.patch_nums: Tuple[int] = patch_nums
+
+        # `self.L` 是所有阶段的图像块数量的平方和。这个值用于确定模型的输入长度。
         self.L = sum(pn ** 2 for pn in self.patch_nums)
+
+        # `self.first_l` 是第一个阶段的图像块数量的平方。这个值用于确定模型的输入长度。
         self.first_l = self.patch_nums[0] ** 2
+        # `self.begin_ends` 是一个列表，其中包含了每个阶段的图像块数量的开始和结束索引。
         self.begin_ends = []
-        cur = 0
-        for i, pn in enumerate(self.patch_nums):
-            self.begin_ends.append((cur, cur+pn ** 2))
-            cur += pn ** 2
-        
+        cur = 0  # 初始化当前的累计图像块数量
+        for i, pn in enumerate(self.patch_nums):  # 遍历每个阶段的图像块数量
+            self.begin_ends.append((cur, cur + pn ** 2))  # 计算并存储当前阶段的开始和结束索引
+            cur += pn ** 2  # 更新当前的累计图像块数量
+        # `self.num_stages_minus_1` 是阶段数量减一。
         self.num_stages_minus_1 = len(self.patch_nums) - 1
+        # `self.rng` 是一个随机数生成器。
         self.rng = torch.Generator(device=dist.get_device())
         
-        # 1. input (word) embedding
+        # 输入编码器
+        # 向量量化器
         quant: VectorQuantizer2 = vae_local.quantize
+        # VQVAE网络
         self.vae_proxy: Tuple[VQVAE] = (vae_local,)
+        # VQVAE量化器
         self.vae_quant_proxy: Tuple[VectorQuantizer2] = (quant,)
+        # 词编码器 线性层输入维度为Cvae 词汇表维度，输出维度为C embed_dim
         self.word_embed = nn.Linear(self.Cvae, self.C)
         
-        # 2. class embedding
+        # 2. 分类编码器
+        # 计算初始化标准差
         init_std = math.sqrt(1 / self.C / 3)
+
+        # 设置类别数量
         self.num_classes = num_classes
-        self.uniform_prob = torch.full((1, num_classes), fill_value=1.0 / num_classes, dtype=torch.float32, device=dist.get_device())
+        # 创建一个全是1/num_classes的张量，表示每个类别的初始概率
+        self.uniform_prob = torch.full((1, num_classes), fill_value=1.0 / num_classes, dtype=torch.float32,
+                                       device=dist.get_device())
+        # 创建一个嵌入层，用于将类别标签转换为嵌入向量
         self.class_emb = nn.Embedding(self.num_classes + 1, self.C)
+        # 使用截断正态分布初始化嵌入层的权重
         nn.init.trunc_normal_(self.class_emb.weight.data, mean=0, std=init_std)
+        # 创建一个参数，表示位置的起始点
         self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
+        # 使用截断正态分布初始化位置起始点的值
         nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
-        
+
         # 3. absolute position embedding
-        pos_1LC = []
+        # 3. 绝对位置嵌入
+        pos_1LC = []  # 初始化一个空列表，用于存储每个阶段的位置嵌入
+        # 遍历每个阶段的图像块数量
         for i, pn in enumerate(self.patch_nums):
-            pe = torch.empty(1, pn*pn, self.C)
+            # 创建一个空的张量，形状为 (1, pn*pn, self.C)
+            pe = torch.empty(1, pn * pn, self.C)
+            # 使用截断正态分布初始化张量的值
             nn.init.trunc_normal_(pe, mean=0, std=init_std)
+            # 将张量添加到列表中
             pos_1LC.append(pe)
-        pos_1LC = torch.cat(pos_1LC, dim=1)     # 1, L, C
+        # 将列表中的所有张量沿着第一个维度拼接起来，形状为 (1, L, C)
+        pos_1LC = torch.cat(pos_1LC, dim=1)
+        # 确保拼接后的张量的形状是正确的
         assert tuple(pos_1LC.shape) == (1, self.L, self.C)
+        # 将拼接后的张量转换为模型的参数
         self.pos_1LC = nn.Parameter(pos_1LC)
-        # level embedding (similar to GPT's segment embedding, used to distinguish different levels of token pyramid)
+
+        # 级别嵌入（类似于 GPT 的段落嵌入，用于区分 token 金字塔的不同级别）
+        # 创建一个嵌入层，输入维度为阶段数量，输出维度为嵌入维度
         self.lvl_embed = nn.Embedding(len(self.patch_nums), self.C)
+        # 使用截断正态分布初始化嵌入层的权重
         nn.init.trunc_normal_(self.lvl_embed.weight.data, mean=0, std=init_std)
         
         # 4. backbone blocks
@@ -101,17 +135,27 @@ class VAR(nn.Module):
             f'    [drop ratios ] drop_rate={drop_rate}, attn_drop_rate={attn_drop_rate}, drop_path_rate={drop_path_rate:g} ({torch.linspace(0, drop_path_rate, depth)})',
             end='\n\n', flush=True
         )
-        
+
         # 5. attention mask used in training (for masking out the future)
         #    it won't be used in inference, since kv cache is enabled
-        d: torch.Tensor = torch.cat([torch.full((pn*pn,), i) for i, pn in enumerate(self.patch_nums)]).view(1, self.L, 1)
-        dT = d.transpose(1, 2)    # dT: 11L
+        # `d` 是一个张量，它的形状是 (1, self.L, 1)。它的值是每个阶段的图像块数量的平方。
+        d: torch.Tensor = torch.cat([torch.full((pn * pn,), i) for i, pn in enumerate(self.patch_nums)]).view(1, self.L,1)
+
+        # `dT` 是 `d` 的转置，它的形状是 (1, 1, self.L)。
+        dT = d.transpose(1, 2)  # dT: 11L
+
+        # `lvl_1L` 是 `dT` 的第一列，它的形状是 (1, self.L)。
         lvl_1L = dT[:, 0].contiguous()
+
+        # 将 `lvl_1L` 注册为模型的缓冲区。
         self.register_buffer('lvl_1L', lvl_1L)
+        # `attn_bias_for_masking` 是一个张量，它的形状是 (1, 1, self.L, self.L)。它的值是 `d` 和 `dT` 的比较结果，如果 `d` 大于等于 `dT`，则值为 0，否则值为负无穷。
         attn_bias_for_masking = torch.where(d >= dT, 0., -torch.inf).reshape(1, 1, self.L, self.L)
+
+        # 将 `attn_bias_for_masking` 注册为模型的缓冲区。
         self.register_buffer('attn_bias_for_masking', attn_bias_for_masking.contiguous())
         
-        # 6. classifier head
+        # 6. 分类头
         self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
         self.head = nn.Linear(self.C, self.V)
     
