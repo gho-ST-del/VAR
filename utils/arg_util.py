@@ -1,3 +1,4 @@
+import json
 import os
 import random
 import re
@@ -23,7 +24,6 @@ import dist
 
 class Args(Tap):
     data_path: str = '/path/to/imagenet'
-    data_name: str = 'imagenet'
     exp_name: str = 'text'
     
     # VAE
@@ -31,38 +31,38 @@ class Args(Tap):
     # VAR
     tfast: int = 0      # torch.compile VAR; =0: not compile; 1: compile with 'reduce-overhead'; 2: compile with 'max-autotune'
     depth: int = 16     # VAR depth
-    saln: bool = False  # whether to use shared adaln
-    cos: bool = False   # whether to use cosine attn
-    fuse: bool = True   # whether to use fused op like flash attn, xformers, fused MLP, fused LayerNorm, etc.
     # VAR initialization
-    ini: float = 0.02
+    ini: float = -1     # -1: automated model parameter initialization
     hd: float = 0.02    # head.w *= hd
     aln: float = 0.5    # the multiplier of ada_lin.w's initialization
     alng: float = 1e-5  # the multiplier of ada_lin.w[gamma channels]'s initialization
     # VAR optimization
-    fp16: int = 0       # 1: using fp16, 2: bf16
-    tblr: float = 6e-4      # base lr
+    fp16: int = 0           # 1: using fp16, 2: bf16
+    tblr: float = 1e-4      # base lr
     tlr: float = None       # lr = base lr * (bs / 256)
     twd: float = 0.05       # initial wd
     twde: float = 0         # final wd, =twde or twd
     tclip: float = 2.       # <=0 for not using grad clip
     ls: float = 0.0         # label smooth
     
-    bs: int = 512           # global batch size
+    bs: int = 768           # global batch size
     batch_size: int = 0     # [automatically set; don't specify this] batch size per GPU = round(args.bs / args.ac / dist.get_world_size() / 8) * 8
     glb_batch_size: int = 0 # [automatically set; don't specify this] global batch size = args.batch_size * dist.get_world_size()
     ac: int = 1             # gradient accumulation
     
-    ep: int = 100
+    ep: int = 250
     wp: float = 0
     wp0: float = 0.005      # initial lr ratio at the begging of lr warm up
     wpe: float = 0.01       # final lr ratio at the end of training
     sche: str = 'lin0'      # lr schedule
     
     opt: str = 'adamw'      # lion: https://cloud.tencent.com/developer/article/2336657?areaId=106001 lr=5e-5 (0.25x) wd=0.8 (8x); Lion needs a large bs to work
-    beta1: float = 0.95     # adamw's beta1
-    oeps: float = 0         # adamw's eps, pixart uses 1e-10
     afuse: bool = True      # fused adamw
+    
+    # other hps
+    saln: bool = False      # whether to use shared adaln
+    anorm: bool = True      # whether to use L2 normalized attention
+    fuse: bool = True       # whether to use fused op like flash attn, xformers, fused MLP, fused LayerNorm, etc.
     
     # data
     pn: str = '1_2_3_4_5_6_8_10_13_16'
@@ -77,22 +77,25 @@ class Args(Tap):
     
     # progressive training
     pg: float = 0.0         # >0 for use progressive training during [0%, this] of training
-    pg0: int = 1            # progressive initial stage, 0: from the 1st token map, 1: from the 2nd token map, etc
-    pgs: str = ''           # only select these specified pns, e.g., 4_8. if this is used, pg0 would be ignored
+    pg0: int = 4            # progressive initial stage, 0: from the 1st token map, 1: from the 2nd token map, etc
     pgwp: float = 0         # num of warmup epochs at each progressive stage
-    prog_patch_nums: tuple = None           # [automatically set; don't specify this]
-    candidate_prog_si: np.ndarray = None    # [automatically set; don't specify this]
     
     # would be automatically set in runtime
     cmd: str = ' '.join(sys.argv[1:])  # [automatically set; don't specify this]
     branch: str = subprocess.check_output(f'git symbolic-ref --short HEAD 2>/dev/null || git rev-parse HEAD', shell=True).decode('utf-8').strip() or '[unknown]' # [automatically set; don't specify this]
     commit_id: str = subprocess.check_output(f'git rev-parse HEAD', shell=True).decode('utf-8').strip() or '[unknown]'  # [automatically set; don't specify this]
     commit_msg: str = (subprocess.check_output(f'git log -1', shell=True).decode('utf-8').strip().splitlines() or ['[unknown]'])[-1].strip()    # [automatically set; don't specify this]
-    max_acc_mean: float = None  # [automatically set; don't specify this]
-    max_acc_tail: float = None  # [automatically set; don't specify this]
-    min_L_mean: float = None    # [automatically set; don't specify this]
-    min_L_tail: float = None    # [automatically set; don't specify this]
+    acc_mean: float = None      # [automatically set; don't specify this]
+    acc_tail: float = None      # [automatically set; don't specify this]
+    L_mean: float = None        # [automatically set; don't specify this]
+    L_tail: float = None        # [automatically set; don't specify this]
+    vacc_mean: float = None     # [automatically set; don't specify this]
+    vacc_tail: float = None     # [automatically set; don't specify this]
+    vL_mean: float = None       # [automatically set; don't specify this]
+    vL_tail: float = None       # [automatically set; don't specify this]
     grad_norm: float = None     # [automatically set; don't specify this]
+    cur_lr: float = None        # [automatically set; don't specify this]
+    cur_wd: float = None        # [automatically set; don't specify this]
     cur_it: str = ''            # [automatically set; don't specify this]
     cur_ep: str = ''            # [automatically set; don't specify this]
     remain_time: str = ''       # [automatically set; don't specify this]
@@ -171,6 +174,27 @@ class Args(Tap):
             print(f'[tf32] [ conv ] torch.backends.cudnn.allow_tf32: {torch.backends.cudnn.allow_tf32}')
             print(f'[tf32] [matmul] torch.backends.cuda.matmul.allow_tf32: {torch.backends.cuda.matmul.allow_tf32}')
     
+    def dump_log(self):
+        if not dist.is_local_master():
+            return
+        if '1/' in self.cur_ep: # first time to dump log
+            with open(self.log_txt_path, 'w') as fp:
+                json.dump({'is_master': dist.is_master(), 'name': self.exp_name, 'cmd': self.cmd, 'commit': self.commit_id, 'branch': self.branch, 'tb_log_dir_path': self.tb_log_dir_path}, fp, indent=0)
+                fp.write('\n')
+        
+        log_dict = {}
+        for k, v in {
+            'it': self.cur_it, 'ep': self.cur_ep,
+            'lr': self.cur_lr, 'wd': self.cur_wd, 'grad_norm': self.grad_norm,
+            'L_mean': self.L_mean, 'L_tail': self.L_tail, 'acc_mean': self.acc_mean, 'acc_tail': self.acc_tail,
+            'vL_mean': self.vL_mean, 'vL_tail': self.vL_tail, 'vacc_mean': self.vacc_mean, 'vacc_tail': self.vacc_tail,
+            'remain_time': self.remain_time, 'finish_time': self.finish_time,
+        }.items():
+            if hasattr(v, 'item'): v = v.item()
+            log_dict[k] = v
+        with open(self.log_txt_path, 'a') as fp:
+            fp.write(f'{log_dict}\n')
+    
     def __str__(self):
         s = []
         for k in self.class_variables.keys():
@@ -195,6 +219,9 @@ def init_dist_and_get_args():
         args.afuse = False
         args.pg = 0.8
         args.pg0 = 1
+    else:
+        if args.data_path == '/path/to/imagenet':
+            raise ValueError(f'{"*"*40}  please specify --data_path=/path/to/imagenet  {"*"*40}')
     
     # warn args.extra_args
     if len(args.extra_args) > 0:
@@ -234,13 +261,9 @@ def init_dist_and_get_args():
     args.twde = args.twde or args.twd
     
     if args.wp == 0:
-        args.wp = args.ep * 1/100
+        args.wp = args.ep * 1/50
     
     # update args: progressive training
-    if args.pgs:
-        args.prog_patch_nums = tuple(pn for pn in map(int, args.pgs.replace('-', '_').split('_')) if pn < args.patch_nums[-1])
-        args.candidate_prog_si = np.array([args.patch_nums.index(x) for x in args.prog_patch_nums])
-        args.pg0 = None
     if args.pgwp == 0:
         args.pgwp = args.ep * 1/300
     if args.pg > 0:

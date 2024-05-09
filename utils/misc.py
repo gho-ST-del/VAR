@@ -79,7 +79,7 @@ class SyncPrint(object):
     def __init__(self, local_output_dir, sync_stdout=True):
         self.sync_stdout = sync_stdout
         self.terminal_stream = sys.stdout if sync_stdout else sys.stderr
-        fname = os.path.join(local_output_dir, 'b1_stdout.txt' if sync_stdout else 'b2_stderr.txt')
+        fname = os.path.join(local_output_dir, 'stdout.txt' if sync_stdout else 'stderr.txt')
         existing = os.path.exists(fname)
         self.file_stream = open(fname, 'a')
         if existing:
@@ -355,3 +355,27 @@ def auto_resume(args: arg_util.Args, pattern='ckpt*.pth') -> Tuple[List[str], in
         ep, it = ckpt['epoch'], ckpt['iter']
         info.append(f'[auto_resume success] resume from ep{ep}, it{it}')
         return info, ep, it, ckpt['trainer'], ckpt['args']
+
+
+def create_npz_from_sample_folder(sample_folder: str):
+    """
+    Builds a single .npz file from a folder of .png samples. Refer to DiT.
+    """
+    import os, glob
+    import numpy as np
+    from tqdm import tqdm
+    from PIL import Image
+    
+    samples = []
+    pngs = glob.glob(os.path.join(sample_folder, '*.png')) + glob.glob(os.path.join(sample_folder, '*.PNG'))
+    assert len(pngs) == 50_000, f'{len(pngs)} png files found in {sample_folder}, but expected 50,000'
+    for png in tqdm(pngs, desc='Building .npz file from samples (png only)'):
+        with Image.open(png) as sample_pil:
+            sample_np = np.asarray(sample_pil).astype(np.uint8)
+        samples.append(sample_np)
+    samples = np.stack(samples)
+    assert samples.shape == (50_000, samples.shape[1], samples.shape[2], 3)
+    npz_path = f'{sample_folder}.npz'
+    np.savez(npz_path, arr_0=samples)
+    print(f'Saved .npz file to {npz_path} [shape={samples.shape}].')
+    return npz_path
